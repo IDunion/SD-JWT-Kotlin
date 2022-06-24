@@ -1,9 +1,8 @@
 package com.yes.sd_jwt
 
-import com.nimbusds.jose.JWSAlgorithm
-import com.nimbusds.jose.JWSHeader
-import com.nimbusds.jose.JWSObject
-import com.nimbusds.jose.Payload
+import com.nimbusds.jose.*
+import com.nimbusds.jose.crypto.DirectDecrypter
+import com.nimbusds.jose.crypto.DirectEncrypter
 import com.nimbusds.jose.crypto.Ed25519Signer
 import com.nimbusds.jose.crypto.Ed25519Verifier
 import com.nimbusds.jose.crypto.RSASSASigner
@@ -18,53 +17,71 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.MessageDigest
-import java.security.SecureRandom
+import org.json.JSONTokener
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.util.*
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.SecretKeySpec
 
-fun createHash(value: String): String {
-    val hashFunction = MessageDigest.getInstance("SHA-256")
-    val messageDigest = hashFunction.digest(value.toByteArray(Charsets.UTF_8))
-    return b64Encoder(messageDigest)
-}
-
-fun buildSvcAndSdClaims(claims: JSONObject, depth: Int): Pair<JSONObject, JSONObject> {
+fun buildSvcAndSdClaims(claims: JSONObject, depth: Int, secretKey: SecretKey): Pair<JSONObject, JSONObject> {
     val svcClaims = JSONObject()
-    val sdClaims = JSONObject()
-
-    val secureRandom = SecureRandom()
+    val sdTags = JSONObject()
 
     for (key in claims.keys()) {
-        if (claims[key] is String || depth == 0) {
-            // Generate salt
-            val randomness = ByteArray(16)
-            secureRandom.nextBytes(randomness)
-            val salt = b64Encoder(randomness)
+        if (claims[key] is String || claims[key] is JSONArray || depth == 0) {
+            // Encode claim correctly for JWE
+            val claimStr = if (claims[key] is String) {
+                JSONObject.valueToString(claims.getString(key))
+            } else if (claims[key] is JSONObject) {
+                claims.getJSONObject(key).toString()
+            } else {
+                claims.getJSONArray(key).toString()
+            }
 
-            // Encode salt and value together
-            val saltValueEncoded = JSONArray().put(salt).put(claims[key]).toString()
-            svcClaims.put(key, saltValueEncoded)
+            // Create JWE with claim as payload
+            val header = JWEHeader(JWEAlgorithm.DIR, EncryptionMethod.A128GCM)
+            val payload = Payload(claimStr)
+            val jweObject = JWEObject(header, payload)
+            jweObject.encrypt(DirectEncrypter(secretKey))
+            val jweSerialized = jweObject.serialize()
 
-            sdClaims.put(key, createHash(saltValueEncoded))
+            // Split JWE in authentication tag and rest
+            val jweSplits = jweSerialized.split(".")
+            val authTag = jweSplits[4]
+            val rest = "${jweSplits[0]}.${jweSplits[1]}.${jweSplits[2]}.${jweSplits[3]}"
+
+            svcClaims.put(key, rest)
+            sdTags.put(key, authTag)
         } else if (claims[key] is JSONObject && depth > 0) {
-            val (svcClaimsChild, sdClaimsChild) = buildSvcAndSdClaims(claims.getJSONObject(key), depth - 1)
+            val (svcClaimsChild, sdClaimsChild) = buildSvcAndSdClaims(claims.getJSONObject(key), depth - 1, secretKey)
             svcClaims.put(key, svcClaimsChild)
-            sdClaims.put(key, sdClaimsChild)
+            sdTags.put(key, sdClaimsChild)
         } else {
             throw Exception("Cannot encode class")
         }
     }
 
-    return Pair(svcClaims, sdClaims)
+    return Pair(svcClaims, sdTags)
 }
 
-inline fun <reified T> createCredential(claims: T, holderPubKey: JWK?, issuer: String, issuerKey: JWK, depth: Int = 0): String {
-    val jsonClaims = JSONObject(Json.encodeToString(claims))
-    val (svcClaims, sdClaims) = buildSvcAndSdClaims(jsonClaims, depth)
+inline fun <reified T> createCredential(
+    claims: T,
+    holderPubKey: JWK?,
+    issuer: String,
+    issuerKey: JWK,
+    depth: Int = 0
+): String {
+    // Generate encryption key
+    val keyGen = KeyGenerator.getInstance("AES");
+    keyGen.init(EncryptionMethod.A128GCM.cekBitLength())
+    val key = keyGen.generateKey()
 
-    val svc = JSONObject().put("_sd", svcClaims)
+    val jsonClaims = JSONObject(Json.encodeToString(claims))
+    val (svcClaims, sdTags) = buildSvcAndSdClaims(jsonClaims, depth, key)
+
+    val svc = JSONObject().put("sd_release", svcClaims)
     val svcEncoded = b64Encoder(svc.toString())
 
     val date = LocalDateTime.now().toEpochSecond(ZoneOffset.UTC)
@@ -72,7 +89,8 @@ inline fun <reified T> createCredential(claims: T, holderPubKey: JWK?, issuer: S
         .put("iss", issuer)
         .put("iat", date)
         .put("exp", date + 3600 * 24)
-        .put("_sd", sdClaims)
+        .put("sd_key", b64Encoder(key.encoded))
+        .put("sd_tags", sdTags)
     if (holderPubKey != null) {
         // Note that holder binding is not yet defined in the spec
         claimsSet.put("sub_jwk", holderPubKey.toJSONObject())
@@ -91,6 +109,8 @@ fun buildReleaseSdClaims(releaseClaims: JSONObject, svc: JSONObject): JSONObject
             releaseClaimsResult.put(key, svc.getString(key))
         } else if (releaseClaims[key] is JSONObject && svc[key] is String) {
             releaseClaimsResult.put(key, svc.getString(key))
+        } else if (releaseClaims[key] is JSONArray && releaseClaims.getJSONArray(key)[0] == "disclose") {
+            releaseClaimsResult.put(key, svc.getString(key))
         } else if (releaseClaims[key] is JSONObject) {
             val rCR = buildReleaseSdClaims(releaseClaims.getJSONObject(key), svc.getJSONObject(key))
             releaseClaimsResult.put(key, rCR)
@@ -99,7 +119,13 @@ fun buildReleaseSdClaims(releaseClaims: JSONObject, svc: JSONObject): JSONObject
     return releaseClaimsResult
 }
 
-inline fun <reified T> createPresentation(credential: String, releaseClaims: T, audience: String, nonce: String, holderKey: JWK?): String {
+inline fun <reified T> createPresentation(
+    credential: String,
+    releaseClaims: T,
+    audience: String,
+    nonce: String,
+    holderKey: JWK?
+): String {
     // Extract svc as the last part of the credential and parse it as a JSON object
     val credentialParts = credential.split(".")
     val svc = JSONObject(b64Decode(credentialParts[3]))
@@ -108,7 +134,7 @@ inline fun <reified T> createPresentation(credential: String, releaseClaims: T, 
     val releaseDocument = JSONObject()
     releaseDocument.put("nonce", nonce)
     releaseDocument.put("aud", audience)
-    releaseDocument.put("_sd", buildReleaseSdClaims(rC, svc.getJSONObject("_sd")))
+    releaseDocument.put("sd_release", buildReleaseSdClaims(rC, svc.getJSONObject("sd_release")))
 
     // Check if credential has holder binding. If so throw an exception
     // if no holder key is passed to the method.
@@ -156,28 +182,30 @@ fun buildJWT(claims: String, key: JWK?): String {
     }
 }
 
-fun parseAndVerifySdClaims(sdClaims: JSONObject, svc: JSONObject): JSONObject {
+fun parseAndVerifySdClaims(sdClaims: JSONObject, svc: JSONObject, secretKey: SecretKey): JSONObject {
     val sdClaimsParsed = JSONObject()
     for (key in svc.keys()) {
         if (svc[key] is String) {
-            // Verify that the hash in the SD-JWT matches the one created from the SD-JWT Release
-            if (createHash(svc.getString(key)) != sdClaims.getString(key)) {
-                throw Exception("Could not verify credential claims (Claim $key has wrong hash value)")
-            }
-            val sVArray = JSONArray(svc.getString(key))
-            if (sVArray.length() != 2) {
-                throw Exception("Could not verify credential claims (Claim $key has wrong number of array entries)")
-            }
-            sdClaimsParsed.put(key, sVArray[1])
+            // Concatenate JWE object and decrypt it
+            val jweStr = "${svc.getString(key)}.${sdClaims.getString(key)}"
+            val jweObject = JWEObject.parse(jweStr)
+            jweObject.decrypt(DirectDecrypter(secretKey))
+
+            sdClaimsParsed.put(key, JSONTokener(jweObject.payload.toString()).nextValue())
         } else if (svc[key] is JSONObject) {
-            val sCPChild = parseAndVerifySdClaims(sdClaims.getJSONObject(key), svc.getJSONObject(key))
+            val sCPChild = parseAndVerifySdClaims(sdClaims.getJSONObject(key), svc.getJSONObject(key), secretKey)
             sdClaimsParsed.put(key, sCPChild)
         }
     }
     return sdClaimsParsed
 }
 
-inline fun <reified T> verifyPresentation(presentation: String, trustedIssuer: Map<String, String>, expectedNonce: String, expectedAud: String): T {
+inline fun <reified T> verifyPresentation(
+    presentation: String,
+    trustedIssuer: Map<String, String>,
+    expectedNonce: String,
+    expectedAud: String
+): T {
     val pS = presentation.split(".")
     if (pS.size != 6) {
         throw Exception("Presentation has wrong format (Needed 6 parts separated by '.')")
@@ -194,7 +222,16 @@ inline fun <reified T> verifyPresentation(presentation: String, trustedIssuer: M
     val sdJwtReleaseParsed = verifyJWTSignature(sdJwtRelease, holderBinding, false)
     verifyJwtClaims(sdJwtReleaseParsed, expectedNonce, expectedAud)
 
-    val sdClaimsParsed = parseAndVerifySdClaims(sdJwtParsed.getJSONObject("_sd"), sdJwtReleaseParsed.getJSONObject("_sd"))
+    // Extract, decode and parse JWE key
+    val keyBytes = b64DecodeToBytes(sdJwtParsed.getString("sd_key"))
+    val secretKey = SecretKeySpec(keyBytes, 0, keyBytes.size, "AES")
+
+    // Iterate over the JSON structure, decrypt the JWEs and extract the payloads
+    val sdClaimsParsed = parseAndVerifySdClaims(
+        sdJwtParsed.getJSONObject("sd_tags"),
+        sdJwtReleaseParsed.getJSONObject("sd_release"),
+        secretKey
+    )
 
     return Json.decodeFromString(sdClaimsParsed.toString())
 }
@@ -236,14 +273,14 @@ fun verifyJWTSignature(jwt: String, trustedIssuer: Map<String, String>, sdJwt: B
 
     val jwtParsed = SignedJWT.parse(jwt)
     // Verify JWT
-    if(!jwtParsed.verify(verifier)) {
+    if (!jwtParsed.verify(verifier)) {
         throw Exception("Invalid JWT signature")
     }
 
     return body
 }
 
-fun getHolderBinding(sdJwt: JSONObject): Map<String, String>  {
+fun getHolderBinding(sdJwt: JSONObject): Map<String, String> {
     return if (sdJwt.isNull("sub_jwk")) {
         mapOf()
     } else {
@@ -279,6 +316,10 @@ fun b64Encoder(b: ByteArray): String {
 
 fun b64Decode(str: String): String {
     return String(Base64.getUrlDecoder().decode(str))
+}
+
+fun b64DecodeToBytes(str: String): ByteArray {
+    return Base64.getUrlDecoder().decode(str)
 }
 
 fun jwkThumbprint(jwk: JWK): String {

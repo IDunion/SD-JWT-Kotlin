@@ -10,7 +10,7 @@ data class LoginCredential(val given_name: String = "", val family_name: String 
 @Serializable
 data class Address(val street_address: String = "", val locality: String = "", val region: String = "", val country: String = "")
 @Serializable
-data class IdCredential(val given_name: String = "", val family_name: String = "", val email: String = "", val birthday: String = "", val address: Address = Address())
+data class IdCredential(val given_name: String = "", val family_name: String = "", val email: String = "", val birthday: String = "", val nicknames: Set<String> = setOf(), val address: Address = Address())
 
 
 fun main(args: Array<String>) {
@@ -56,7 +56,7 @@ fun main(args: Array<String>) {
     println("====================================================")
     println("                     Issuer                         ")
     println("====================================================")
-    val claims1 = IdCredential("Alice", "Wonderland", "alice@example.com", "1940-01-01", Address("123 Main St", "Anytown", "Anystate", "US"))
+    val claims1 = IdCredential("Alice", "Wonderland", "alice@example.com", "1940-01-01", setOf("A", "B"), Address("123 Main St", "Anytown", "Anystate", "US"))
     println("Claims for credential1: $claims1\n")
 
     val credential1 = createCredential(claims1, holderPublicKey, issuer, issuerKey, 1)
@@ -65,7 +65,7 @@ fun main(args: Array<String>) {
     println("====================================================")
     println("                     Wallet                         ")
     println("====================================================")
-    val releaseClaims1 = IdCredential("disclose", "disclose", "", "", Address("disclose", "disclose", "", ""))
+    val releaseClaims1 = IdCredential("disclose", "disclose", "", "", setOf("disclose"), Address("disclose", "disclose", "", ""))
     val presentation1 = createPresentation(credential1, releaseClaims1, verifier, "12345", holderKey)
     println("Presentation1: $presentation1\n")
 

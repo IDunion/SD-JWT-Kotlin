@@ -14,5 +14,5 @@ on the issuance, wallet and verifier side.
 
 If you have Docker installed you can simply run:
 
-1. `` docker build -t sd-jwt .``
+1. ``docker build -t sd-jwt .``
 2. ``docker run -it --rm sd-jwt``
